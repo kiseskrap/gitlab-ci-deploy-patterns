@@ -1,0 +1,69 @@
+# env-shard.yml
+# ----------------------------------------------------------------------------
+# Map branch / tag patterns to deployment environments. The actual deploy job
+# in your app's .gitlab-ci.yml extends one of the hidden jobs below and
+# inherits the DEPLOY_ENV / AWS_PROFILE variables — no per-env duplication
+# needed in your pipeline.
+#
+# Include in your .gitlab-ci.yml:
+#
+#   include:
+#     - project: 'your-org/gitlab-ci-deploy-patterns'
+#       file: '/templates/env-shard.yml'
+#       ref: v0.1.0
+#
+# Then use:
+#
+#   deploy:dev:
+#     extends: .deploy:dev
+#     script:
+#       - aws s3 sync ./build s3://${APP_NAME}-${DEPLOY_ENV}/
+#
+# The hidden job sets DEPLOY_ENV / AWS_PROFILE and applies the rule that
+# decides when the job runs. Your project's job only describes the actual
+# deploy action.
+# ----------------------------------------------------------------------------
+
+variables:
+  # Override these in your project to point at the right AWS account aliases
+  # configured on the runner. Common pattern is one named profile per env.
+  AWS_PROFILE_DEV:   "dev"
+  AWS_PROFILE_STAGE: "stage"
+  AWS_PROFILE_PROD:  "prod"
+
+# --- dev: develop branch (auto), feature branches (manual) ------------------
+# Auto-run on develop so the dev environment always reflects the latest
+# integration state. Feature branches can deploy manually for review apps
+# without polluting the pipeline log with skipped jobs.
+.deploy:dev:
+  variables:
+    DEPLOY_ENV:  "dev"
+    AWS_PROFILE: $AWS_PROFILE_DEV
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH =~ /^feature\//
+      when: manual
+      allow_failure: true
+
+# --- stage: pushes to main --------------------------------------------------
+# main is the "ready for stage" branch in this convention. Promotion to prod
+# is a separate, tag-driven step (see below) — never a fast-forward from
+# stage that nobody noticed.
+.deploy:stage:
+  variables:
+    DEPLOY_ENV:  "stage"
+    AWS_PROFILE: $AWS_PROFILE_STAGE
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# --- prod: semver tags only, manual gate ------------------------------------
+# Production deploys require an explicit semver tag (vMAJOR.MINOR.PATCH) AND
+# a human pressing the manual-run button. Two-key model on purpose: tag is
+# the "what" (this exact commit), manual click is the "now."
+.deploy:prod:
+  variables:
+    DEPLOY_ENV:  "prod"
+    AWS_PROFILE: $AWS_PROFILE_PROD
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+      when: manual
