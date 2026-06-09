@@ -1,0 +1,148 @@
+# frontend-static.yml
+# ----------------------------------------------------------------------------
+# Deploy a static frontend bundle (React, Vite, plain HTML) to S3 behind
+# CloudFront. Per-env, versioned by git short-SHA:
+#
+#   s3://<bucket>/<env>/<short-sha>/    ← every build lives here forever
+#   s3://<bucket>/<env>/live/           ← copy-pointer to the current build
+#
+# CloudFront serves /<env>/live/*, so a rollback is `aws s3 sync` from any
+# previous <short-sha> folder back to /live/ — no rebuild needed.
+#
+# Include in your .gitlab-ci.yml:
+#
+#   include:
+#     - project: 'your-org/gitlab-ci-deploy-patterns'
+#       file: '/templates/env-shard.yml'
+#       ref: v0.3.0
+#     - project: 'your-org/gitlab-ci-deploy-patterns'
+#       file: '/templates/frontend-static.yml'
+#       ref: v0.3.0
+#
+# Then:
+#
+#   deploy:dev:
+#     extends:
+#       - .deploy:dev          # routes + DEPLOY_ENV
+#       - .static:deploy       # this template's mechanism
+#     variables:
+#       BUILD_DIR:           dist
+#       STATIC_BUCKET:       my-app-static
+#       CLOUDFRONT_DIST_ID:  E1XXXXXXXXXXX
+#       INVALIDATE_PATHS:    "/index.html /assets/*"
+#
+# Consuming pipeline only describes *what* to ship (the build dir + bucket).
+# Versioning, copy-pointer, and CloudFront invalidation are handled here.
+# ----------------------------------------------------------------------------
+
+variables:
+  AWS_CLI_VERSION: "2"
+  # Default cache control for non-HTML assets (long-lived, content-hashed).
+  STATIC_CACHE_CONTROL: "public, max-age=31536000, immutable"
+  # HTML files are short-lived so users pick up the new index.html quickly
+  # after an invalidation.
+  HTML_CACHE_CONTROL:   "public, max-age=60, must-revalidate"
+  # CloudFront invalidation default — override if your routes differ.
+  INVALIDATE_PATHS:     "/index.html"
+
+# --- shared bits ------------------------------------------------------------
+.static:require_vars: &static_require_vars
+  - |
+    set -euo pipefail
+    : "${DEPLOY_ENV:?DEPLOY_ENV is required (use env-shard.yml)}"
+    : "${BUILD_DIR:?BUILD_DIR is required (e.g. dist or build)}"
+    : "${STATIC_BUCKET:?STATIC_BUCKET is required}"
+    : "${CLOUDFRONT_DIST_ID:?CLOUDFRONT_DIST_ID is required}"
+    : "${CI_COMMIT_SHORT_SHA:?run on GitLab CI (CI_COMMIT_SHORT_SHA missing)}"
+    [ -d "$BUILD_DIR" ] || {
+      echo "ERROR: BUILD_DIR '$BUILD_DIR' does not exist. Did the build job run?"
+      exit 1
+    }
+
+# --- deploy job -------------------------------------------------------------
+# Two-phase upload so the live pointer never serves a partially-uploaded
+# build: long-lived assets go up first to the versioned folder, then the
+# HTML (which references those assets by hash), then the live pointer is
+# updated, then CloudFront invalidates.
+.static:deploy:
+  image:
+    name: amazon/aws-cli:$AWS_CLI_VERSION
+    entrypoint: [""]
+  script:
+    - *static_require_vars
+    - |
+      set -euo pipefail
+      VERSION_PREFIX="$DEPLOY_ENV/$CI_COMMIT_SHORT_SHA"
+      LIVE_PREFIX="$DEPLOY_ENV/live"
+
+      echo "Phase 1: upload long-lived assets to s3://$STATIC_BUCKET/$VERSION_PREFIX/"
+      aws s3 sync "$BUILD_DIR/" "s3://$STATIC_BUCKET/$VERSION_PREFIX/" \
+        --delete \
+        --exclude "*.html" \
+        --cache-control "$STATIC_CACHE_CONTROL" \
+        --no-progress
+
+      echo "Phase 2: upload HTML to the same versioned folder"
+      aws s3 sync "$BUILD_DIR/" "s3://$STATIC_BUCKET/$VERSION_PREFIX/" \
+        --exclude "*" --include "*.html" \
+        --cache-control "$HTML_CACHE_CONTROL" \
+        --content-type "text/html; charset=utf-8" \
+        --no-progress
+
+      echo "Phase 3: promote $CI_COMMIT_SHORT_SHA to $LIVE_PREFIX/"
+      # Copy (not sync from disk) so we point /live/ at the exact bytes we
+      # just verified in /<short-sha>/, not at whatever the runner has.
+      aws s3 sync "s3://$STATIC_BUCKET/$VERSION_PREFIX/" "s3://$STATIC_BUCKET/$LIVE_PREFIX/" \
+        --delete --no-progress
+
+      echo "Phase 4: CloudFront invalidate $INVALIDATE_PATHS"
+      # Convert "a b c" into a CLI-friendly path list.
+      # shellcheck disable=SC2086
+      aws cloudfront create-invalidation \
+        --distribution-id "$CLOUDFRONT_DIST_ID" \
+        --paths $INVALIDATE_PATHS \
+        --query 'Invalidation.Id' --output text
+
+      echo "Deployed $CI_COMMIT_SHORT_SHA to $DEPLOY_ENV."
+      echo "Rollback recipe: aws s3 sync s3://$STATIC_BUCKET/$DEPLOY_ENV/<previous-sha>/ s3://$STATIC_BUCKET/$LIVE_PREFIX/ --delete"
+
+# --- rollback job (manual) --------------------------------------------------
+# Triggered manually with ROLLBACK_TO=<short-sha>. Swaps the live pointer
+# back to a previous versioned folder. No rebuild.
+.static:rollback:
+  image:
+    name: amazon/aws-cli:$AWS_CLI_VERSION
+    entrypoint: [""]
+  script:
+    - |
+      set -euo pipefail
+      : "${DEPLOY_ENV:?DEPLOY_ENV is required}"
+      : "${STATIC_BUCKET:?STATIC_BUCKET is required}"
+      : "${CLOUDFRONT_DIST_ID:?CLOUDFRONT_DIST_ID is required}"
+      : "${ROLLBACK_TO:?ROLLBACK_TO=<short-sha> is required for rollback}"
+
+      VERSION_PREFIX="$DEPLOY_ENV/$ROLLBACK_TO"
+      LIVE_PREFIX="$DEPLOY_ENV/live"
+
+      # Sanity check: target version must exist.
+      OBJECT_COUNT=$(aws s3 ls "s3://$STATIC_BUCKET/$VERSION_PREFIX/" --recursive \
+                     | wc -l | tr -d ' ')
+      if [ "$OBJECT_COUNT" = "0" ]; then
+        echo "ERROR: no objects found at s3://$STATIC_BUCKET/$VERSION_PREFIX/"
+        echo "       Either the SHA is wrong or that build was already cleaned up."
+        exit 1
+      fi
+
+      echo "Rolling $DEPLOY_ENV back to $ROLLBACK_TO ($OBJECT_COUNT objects)"
+      aws s3 sync "s3://$STATIC_BUCKET/$VERSION_PREFIX/" "s3://$STATIC_BUCKET/$LIVE_PREFIX/" \
+        --delete --no-progress
+
+      # shellcheck disable=SC2086
+      aws cloudfront create-invalidation \
+        --distribution-id "$CLOUDFRONT_DIST_ID" \
+        --paths $INVALIDATE_PATHS \
+        --query 'Invalidation.Id' --output text
+
+      echo "Rolled $DEPLOY_ENV back to $ROLLBACK_TO."
+  rules:
+    - when: manual
