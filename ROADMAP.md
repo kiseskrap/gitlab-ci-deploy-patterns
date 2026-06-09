@@ -15,7 +15,7 @@ GitLab CI templates for the most common AWS backend deploy patterns.
 
 ## v0.4 — examples + polish
 
-- [ ] `examples/demo-app/` — toy backend (minimal Node or Python service) showing template usage end-to-end with `.gitlab-ci.yml`.
+- [x] `examples/demo-app/` — toy backend (minimal Node service) showing template usage end-to-end with `.gitlab-ci.yml`.
 - [ ] `examples/demo-app-frontend/` — toy frontend showing the static template against a fake "AcmeShop platform" use case.
 
 ## v1.0 — release
