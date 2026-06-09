@@ -11,7 +11,7 @@ GitLab CI templates for the most common AWS backend deploy patterns.
 
 ## v0.3 — frontend templates
 
-- [ ] `templates/frontend-static.yml` — S3 sync + CloudFront invalidation, with versioned per-env folders so rollbacks are a folder swap.
+- [x] `templates/frontend-static.yml` — S3 sync + CloudFront invalidation, with versioned per-env folders so rollbacks are a folder swap.
 
 ## v0.4 — examples + polish
 
