@@ -42,7 +42,7 @@ The `extends: .deploy:dev` line wires up the right `DEPLOY_ENV` / `AWS_PROFILE` 
 | Template | Status | What it does |
 |----------|--------|--------------|
 | `templates/env-shard.yml` | shipped | Branch / tag → environment mapping with sensible defaults for dev / stage / prod |
-| `templates/ecs-deploy.yml` | planned | dev/stage `force-new-deployment`, prod CodeDeploy blue/green with AppSpec generator |
+| `templates/ecs-deploy.yml` | shipped | dev/stage `force-new-deployment`, prod CodeDeploy blue/green with runtime-generated AppSpec and an in-flight pre-check |
 | `templates/frontend-static.yml` | planned | S3 sync + CloudFront invalidation with versioned per-env folders |
 
 See [ROADMAP.md](./ROADMAP.md) for the full sequence.
