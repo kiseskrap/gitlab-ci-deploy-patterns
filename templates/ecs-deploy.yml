@@ -1,0 +1,201 @@
+# ecs-deploy.yml
+# ----------------------------------------------------------------------------
+# Per-env ECS deploy template. Two strategies behind one interface:
+#
+#   - dev / stage: aws ecs update-service --force-new-deployment
+#     Fast, low-ceremony, fine for non-prod. Re-uses the existing task def.
+#
+#   - prod: CodeDeploy blue/green via the ECS deployment controller.
+#     Generates an AppSpec at runtime pointing at the new task definition,
+#     then aws deploy create-deployment with that AppSpec. Blocks if a
+#     prior deployment is still in flight.
+#
+# Designed to compose with env-shard.yml — extending both gives you both
+# the env routing rule and the right deploy mechanism in one job.
+#
+# Include in your .gitlab-ci.yml:
+#
+#   include:
+#     - project: 'your-org/gitlab-ci-deploy-patterns'
+#       file: '/templates/env-shard.yml'
+#       ref: v0.2.0
+#     - project: 'your-org/gitlab-ci-deploy-patterns'
+#       file: '/templates/ecs-deploy.yml'
+#       ref: v0.2.0
+#
+# Then use:
+#
+#   deploy:dev:
+#     extends:
+#       - .deploy:dev          # from env-shard: routes + variables
+#       - .ecs:deploy:force    # from this file: deploy mechanism
+#     variables:
+#       APP_NAME:    my-service
+#       CLUSTER:     my-cluster
+#       SERVICE:     my-service
+#       TASK_FAMILY: my-service-task
+#       IMAGE_URI:   $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+#
+# The consuming pipeline only describes the *what*; routing + deploy
+# mechanism come from the templates.
+# ----------------------------------------------------------------------------
+
+variables:
+  # Override these in your project if your image is named differently.
+  AWS_CLI_VERSION: "2"
+  # The CodeDeploy application + deployment group is conventionally named
+  # after the ECS service. Override per project if your naming differs.
+  CODEDEPLOY_APP:    "$SERVICE"
+  CODEDEPLOY_GROUP:  "$SERVICE-dg"
+
+# --- shared bits ------------------------------------------------------------
+# Anchor: scripts that show up in multiple jobs. Keep one source of truth
+# for "register a new task definition revision" since both strategies need
+# the new revision ARN.
+.ecs:register_taskdef: &ecs_register_taskdef
+  - |
+    set -euo pipefail
+    : "${APP_NAME:?APP_NAME is required}"
+    : "${CLUSTER:?CLUSTER is required}"
+    : "${SERVICE:?SERVICE is required}"
+    : "${TASK_FAMILY:?TASK_FAMILY is required}"
+    : "${IMAGE_URI:?IMAGE_URI is required}"
+    echo "Registering task def for $TASK_FAMILY with image $IMAGE_URI"
+
+    # Pull the current task def, swap the image, register the new revision.
+    aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
+      --query 'taskDefinition' --output json > current-taskdef.json
+
+    # Strip fields the register call rejects, then patch the image.
+    jq --arg img "$IMAGE_URI" '
+      del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+          .compatibilities, .registeredAt, .registeredBy)
+      | .containerDefinitions[0].image = $img
+    ' current-taskdef.json > new-taskdef.json
+
+    NEW_TASKDEF_ARN=$(
+      aws ecs register-task-definition \
+        --cli-input-json file://new-taskdef.json \
+        --query 'taskDefinition.taskDefinitionArn' --output text
+    )
+    echo "$NEW_TASKDEF_ARN" > new-taskdef.arn
+    echo "New task def: $NEW_TASKDEF_ARN"
+
+# --- dev / stage: force-new-deployment -------------------------------------
+# Register the new revision then aws ecs update-service. ECS handles the
+# rolling replace using the service's existing deployment configuration.
+.ecs:deploy:force:
+  image:
+    name: amazon/aws-cli:$AWS_CLI_VERSION
+    entrypoint: [""]
+  before_script:
+    - yum install -y jq >/dev/null
+  script:
+    - *ecs_register_taskdef
+    - |
+      set -euo pipefail
+      NEW_TASKDEF_ARN=$(cat new-taskdef.arn)
+      aws ecs update-service \
+        --cluster "$CLUSTER" \
+        --service "$SERVICE" \
+        --task-definition "$NEW_TASKDEF_ARN" \
+        --force-new-deployment \
+        --output text > /dev/null
+      echo "Force-deploy triggered on $CLUSTER/$SERVICE"
+      aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+      echo "Service stable"
+  artifacts:
+    paths:
+      - new-taskdef.json
+      - new-taskdef.arn
+    expire_in: 1 week
+    when: always
+
+# --- prod: CodeDeploy blue/green -------------------------------------------
+# Generate an AppSpec at deploy time so the new task def ARN is embedded
+# correctly, then create-deployment. The pre-check blocks if a prior
+# deployment is still running — two pipelines racing produce an error you
+# get to debug at 2am, not at the next push.
+.ecs:deploy:bluegreen:
+  image:
+    name: amazon/aws-cli:$AWS_CLI_VERSION
+    entrypoint: [""]
+  before_script:
+    - yum install -y jq >/dev/null
+  script:
+    - |
+      set -euo pipefail
+      : "${CODEDEPLOY_APP:?CODEDEPLOY_APP is required}"
+      : "${CODEDEPLOY_GROUP:?CODEDEPLOY_GROUP is required}"
+      echo "Pre-check: any in-flight deployment for $CODEDEPLOY_APP/$CODEDEPLOY_GROUP?"
+      IN_FLIGHT=$(
+        aws deploy list-deployments \
+          --application-name "$CODEDEPLOY_APP" \
+          --deployment-group-name "$CODEDEPLOY_GROUP" \
+          --include-only-statuses Created Queued InProgress Ready \
+          --query 'deployments[]' --output text || true
+      )
+      if [ -n "$IN_FLIGHT" ]; then
+        echo "ERROR: deployment(s) already in flight: $IN_FLIGHT"
+        echo "Refusing to start a second deploy. Wait or cancel the existing one."
+        exit 1
+      fi
+    - *ecs_register_taskdef
+    - |
+      set -euo pipefail
+      NEW_TASKDEF_ARN=$(cat new-taskdef.arn)
+      CONTAINER_NAME=$(jq -r '.containerDefinitions[0].name' new-taskdef.json)
+      CONTAINER_PORT=$(jq -r '.containerDefinitions[0].portMappings[0].containerPort' new-taskdef.json)
+
+      # Generate the AppSpec. CodeDeploy reads the LATEST keyword as
+      # "the task def I'm about to register" — but we want our specific
+      # revision, so we embed the ARN explicitly.
+      cat > appspec.json <<APPSPEC
+      {
+        "version": 0.0,
+        "Resources": [{
+          "TargetService": {
+            "Type": "AWS::ECS::Service",
+            "Properties": {
+              "TaskDefinition": "$NEW_TASKDEF_ARN",
+              "LoadBalancerInfo": {
+                "ContainerName": "$CONTAINER_NAME",
+                "ContainerPort": $CONTAINER_PORT
+              }
+            }
+          }
+        }]
+      }
+      APPSPEC
+
+      # CodeDeploy expects AppSpec as a single-line escaped string inside
+      # the revision payload — jq @json handles the escaping.
+      APPSPEC_ESCAPED=$(jq -Rs '.' < appspec.json)
+
+      cat > revision.json <<REVISION
+      {
+        "revisionType": "AppSpecContent",
+        "appSpecContent": {
+          "content": $APPSPEC_ESCAPED
+        }
+      }
+      REVISION
+
+      DEPLOY_ID=$(
+        aws deploy create-deployment \
+          --application-name "$CODEDEPLOY_APP" \
+          --deployment-group-name "$CODEDEPLOY_GROUP" \
+          --revision file://revision.json \
+          --query 'deploymentId' --output text
+      )
+      echo "Started deployment: $DEPLOY_ID"
+      aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"
+      echo "Deployment $DEPLOY_ID succeeded"
+  artifacts:
+    paths:
+      - new-taskdef.json
+      - new-taskdef.arn
+      - appspec.json
+      - revision.json
+    expire_in: 1 month
+    when: always

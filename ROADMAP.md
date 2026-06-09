@@ -7,7 +7,7 @@ Each unchecked item is a future commit. Items are sequenced to deliver increment
 GitLab CI templates for the most common AWS backend deploy patterns.
 
 - [x] `templates/env-shard.yml` — branch / tag → environment mapping with dev / stage / prod defaults.
-- [ ] `templates/ecs-deploy.yml` — dev/stage `force-new-deployment`, prod CodeDeploy blue/green with AppSpec generator. Includes a pre-check that blocks deploy when another is already in flight.
+- [x] `templates/ecs-deploy.yml` — dev/stage `force-new-deployment`, prod CodeDeploy blue/green with AppSpec generator. Includes a pre-check that blocks deploy when another is already in flight.
 
 ## v0.3 — frontend templates
 
