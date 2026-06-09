@@ -1,0 +1,79 @@
+# Example consuming pipeline for the gitlab-ci-deploy-patterns templates.
+#
+# In real use, this file lives at the repo root of the app. Here it lives
+# under examples/demo-app/ so the parent repo can ship it alongside the
+# templates that it depends on.
+#
+# Two templates are included — env-shard gives routing rules, ecs-deploy
+# gives the deploy mechanism. Each deploy job extends one of each.
+# ----------------------------------------------------------------------------
+
+include:
+  - project: 'your-org/gitlab-ci-deploy-patterns'
+    file: '/templates/env-shard.yml'
+    ref: v0.3.0
+  - project: 'your-org/gitlab-ci-deploy-patterns'
+    file: '/templates/ecs-deploy.yml'
+    ref: v0.3.0
+
+stages:
+  - build
+  - deploy
+
+variables:
+  # AcmeShop convention: <platform>-<service> for repo + ECS naming.
+  APP_NAME:    "acmeshop-orders"
+  TASK_FAMILY: "acmeshop-orders-task"
+  IMAGE_URI:   "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+
+# --- build: container image -------------------------------------------------
+build:image:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  script:
+    - cd examples/demo-app
+    - docker build -t "$IMAGE_URI" .
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker push "$IMAGE_URI"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+
+# --- deploy:dev: develop branch, fast force-deploy --------------------------
+deploy:dev:
+  stage: deploy
+  extends:
+    - .deploy:dev          # routes (develop branch → dev)
+    - .ecs:deploy:force    # mechanism (force-new-deployment)
+  needs: [build:image]
+  variables:
+    CLUSTER: "acmeshop-dev"
+    SERVICE: "acmeshop-orders"
+
+# --- deploy:stage: main branch, force-deploy --------------------------------
+deploy:stage:
+  stage: deploy
+  extends:
+    - .deploy:stage
+    - .ecs:deploy:force
+  needs: [build:image]
+  variables:
+    CLUSTER: "acmeshop-stage"
+    SERVICE: "acmeshop-orders"
+
+# --- deploy:prod: semver tags, manual gate, blue/green ----------------------
+deploy:prod:
+  stage: deploy
+  extends:
+    - .deploy:prod              # routes (semver tag + manual)
+    - .ecs:deploy:bluegreen     # mechanism (CodeDeploy + in-flight check)
+  needs: [build:image]
+  variables:
+    CLUSTER: "acmeshop-prod"
+    SERVICE: "acmeshop-orders"
+    # CodeDeploy app + group default to $SERVICE / $SERVICE-dg in the
+    # template — overriding here only if the consumer needs a different
+    # convention.
